@@ -21,7 +21,7 @@ from array import array
 
 from . import constants
 from ..utils import ByteBuffer
-from ..errors import (CompletionCodeError, EncodingError, DecodingError,
+from ..errors import (CompletionCodeError, MessageStatusCodeError, EncodingError, DecodingError,
                       DescriptionError)
 
 
@@ -134,6 +134,17 @@ class CompletionCode(UnsignedInt):
         cc = getattr(obj, self.name)
         if cc != constants.CC_OK:
             raise CompletionCodeError(cc)
+
+
+class MessageStatusCode(UnsignedInt):
+    def __init__(self, name="message_status_code"):
+        UnsignedInt.__init__(self, name, 1, None)
+
+    def decode(self, obj, data):
+        UnsignedInt.decode(self, obj, data)
+        msc = getattr(obj, self.name)
+        if msc != constants.MSC_OK:
+            raise MessageStatusCodeError(msc)
 
 
 class UnsignedIntMask(UnsignedInt):
@@ -384,6 +395,7 @@ class Message(object):
 
         data = ByteBuffer(data)
         cc = None
+        msc = None
         for field in self.__fields__:
             try:
                 field.decode(self, data)
@@ -391,9 +403,12 @@ class Message(object):
                 # stop decoding on completion code != 0
                 cc = e.cc
                 break
+            except MessageStatusCodeError as e:
+                msc = e.msc
+                break
 
-        if (cc is None or cc == 0) and len(data) > 0:
-            raise DecodingError('Data has extra bytes')
+        if (cc is None or cc == 0) and (msc is None or msc == 0) and len(data) > 0:
+            raise DecodingError('Data has extra bytes: {0}'.format(data.tobytes()))
 
     def _is_request(self):
         return self.__netfn__ & 1 == 0

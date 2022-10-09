@@ -29,6 +29,7 @@ from .message import UnsignedIntMask
 from .message import Timestamp
 from .message import Bitfield
 from .message import CompletionCode
+from .message import MessageStatusCode
 from .message import Conditional
 from .message import Optional
 from .message import RemainingBytes

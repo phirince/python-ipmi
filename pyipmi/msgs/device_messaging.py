@@ -22,6 +22,7 @@ from . import Bitfield
 from . import String
 from . import CompletionCode
 from . import RemainingBytes
+from . import MessageStatusCode
 
 
 @register_message_class
@@ -244,7 +245,7 @@ class GetChannelAuthenticationCapabilitiesReq(Message):
         Bitfield('channel', 1,
                  Bitfield.Bit('number', 4, 0),
                  Bitfield.ReservedBit(3, 0),
-                 Bitfield.Bit('type', 1, 0),),
+                 Bitfield.Bit('type', 1, 1),),
         Bitfield('privilege_level', 1,
                  Bitfield.Bit('requested', 4, 0),
                  Bitfield.ReservedBit(4, 0),),
@@ -322,6 +323,50 @@ class ActivateSessionReq(Message):
         UnsignedInt('initial_outbound_sequence_number', 4),
     )
 
+
+@register_message_class
+class ActivateSOLPayloadReq(Message):
+    __cmdid__ = constants.CMDID_ACTIVATE_PAYLOAD
+    __netfn__ = constants.NETFN_APP
+    __fields__ = (
+        Bitfield('payload_type', 1,
+                 Bitfield.Bit('number', 6, 0),
+                 Bitfield.ReservedBit(2, 0),
+                 ),
+        Bitfield('payload_instance', 1,
+                 Bitfield.Bit('number', 4, 1),
+                 Bitfield.ReservedBit(4, 0),
+                 ),
+        Bitfield('request_data', 4,
+                 Bitfield.ReservedBit(1, 0),
+                 Bitfield.Bit('sol_startup_handshake', 1, 1),
+                 Bitfield.Bit('serial_alert_behavior', 2, 0b01),
+                 Bitfield.ReservedBit(1, 0),
+                 Bitfield.Bit('test_mode', 1, 0),
+                 Bitfield.Bit('authentication_activation', 1, 1),
+                 Bitfield.Bit('payload_encryption', 1, 1),
+                 Bitfield.ReservedBit(24, 0),
+                 ),
+    )
+    def __init__(self, *args, **kwargs):
+        Message.__init__(self, *args, **kwargs)
+        self.payload_type.number = constants.PAYLOAD_TYPE_SOL
+
+@register_message_class
+class ActivateSOLPayloadRsp(Message):
+    __cmdid__ = constants.CMDID_ACTIVATE_PAYLOAD
+    __netfn__ = constants.NETFN_APP | 1
+    __fields__ = (
+        CompletionCode(),
+        Bitfield('response_data', 4,
+                 Bitfield.Bit('test_mode', 1, 0),
+                 Bitfield.ReservedBit(31, 0),
+                 ),
+        UnsignedInt('inbound_payload_size', 2, 0),
+        UnsignedInt('outbound_payload_size', 2, 0),
+        UnsignedInt('payload_port_number', 2, 0),
+        UnsignedInt('vlan_number', 2, 0)
+    )
 
 @register_message_class
 class ActivateSessionRsp(Message):

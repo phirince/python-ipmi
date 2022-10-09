@@ -14,18 +14,22 @@
 # License along with this library; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
 
+import os
 import socket
 import struct
 import hashlib
+import hmac
 import random
 import threading
 from array import array
 from queue import Queue
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from .. import Target
 from ..session import Session
 from ..msgs import (create_message, create_request_by_name,
                     encode_message, decode_message, constants)
+from ..msgs import Message, Bitfield, String, UnsignedInt, MessageStatusCode, VariableByteArray, CompletionCode, RemainingBytes
 from ..messaging import ChannelAuthenticationCapabilities
 from ..errors import DecodingError, NotSupportedError
 from ..logger import log
@@ -223,6 +227,401 @@ class AsfPong(AsfMsg):
             raise DecodingError('Data length mismatch')
 
 
+class OpenSessionReq(Message):
+    __fields__ = (
+        UnsignedInt('message_tag', 1, 0),
+        Bitfield('maximum_privilege', 1,
+                 Bitfield.Bit('privilege_level', 4, 0),
+                 Bitfield.ReservedBit(4, 0),
+                 ),
+        Bitfield('reserved', 2,
+                 Bitfield.ReservedBit(16, 0)
+                 ),
+        String('console_session_id', 4, b"\xA1\xA2\xA3\xA4"), # ipmitool uses 0xA4A3A2A0
+        # Authentication payload
+        Bitfield('authentication', 8,
+                 Bitfield.Bit('type', 8, 0),
+                 Bitfield.ReservedBit(16, 0),
+                 Bitfield.Bit('length', 8, 0x08),
+                 Bitfield.Bit('algorithm', 6, constants.AUTH_ALGO_RAKP_HMAC_SHA1),
+                 Bitfield.ReservedBit(2, 0),
+                 Bitfield.ReservedBit(24, 0)
+                 ),
+        # Integrity payload
+        Bitfield('integrity', 8,
+                 Bitfield.Bit('type', 8, 0x01),
+                 Bitfield.ReservedBit(16, 0),
+                 Bitfield.Bit('length', 8, 0x08),
+                 Bitfield.Bit('algorithm', 6, constants.INTEGRITY_ALGO_HMAC_SHA1_96),
+                 Bitfield.ReservedBit(2, 0),
+                 Bitfield.ReservedBit(24, 0)
+                 ),
+        # Confidentiality payload
+        Bitfield('confidentiality', 8,
+                 Bitfield.Bit('type', 8, 0x02),
+                 Bitfield.ReservedBit(16, 0),
+                 Bitfield.Bit('length', 8, 0x08),
+                 Bitfield.Bit('algorithm', 6, constants.CONFIDENTIALITY_ALGO_AES_CBC_128 ),
+                 Bitfield.ReservedBit(2, 0),
+                 Bitfield.ReservedBit(24, 0)
+                 ),
+    )
+    def __init__(self, authentication_algo, integrity_algo, confidentiality_algo, *args, **kwargs):
+        Message.__init__(self, *args, **kwargs)
+        self.authentication.algorithm = authentication_algo
+        self.integrity.algorithm = integrity_algo
+        self.confidentiality.algorithm = confidentiality_algo
+
+
+class OpenSessionRsp(Message):
+    __fields__ = (
+        UnsignedInt('message_tag', 1, 0),
+        MessageStatusCode(),
+        Bitfield('maximum_privilege', 1,
+                 Bitfield.Bit('privilege_level', 4, 0),
+                 Bitfield.ReservedBit(4, 0),
+                 ),
+        Bitfield('reserved', 1,
+                 Bitfield.ReservedBit(8, 0)
+                 ),
+        String('console_session_id', 4, "\x00" * 4),
+        String('managed_system_session_id', 4, "\x00" * 4),
+        # Authentication payload
+        Bitfield('authentication', 8,
+                 Bitfield.Bit('type', 8, 0),
+                 Bitfield.ReservedBit(16, 0),
+                 Bitfield.Bit('length', 8, 0x08),
+                 Bitfield.Bit('algorithm', 6, 0),
+                 Bitfield.ReservedBit(2, 0),
+                 Bitfield.ReservedBit(24, 0)
+                 ),
+        # Integrity payload
+        Bitfield('integrity', 8,
+                 Bitfield.Bit('type', 8, 0x01),
+                 Bitfield.ReservedBit(16, 0),
+                 Bitfield.Bit('length', 8, 0x08),
+                 Bitfield.Bit('algorithm', 6, 0),
+                 Bitfield.ReservedBit(2, 0),
+                 Bitfield.ReservedBit(24, 0)
+                 ),
+        # Confidentiality payload
+        Bitfield('confidentiality', 8,
+                 Bitfield.Bit('type', 8, 0x02),
+                 Bitfield.ReservedBit(16, 0),
+                 Bitfield.Bit('length', 8, 0x08),
+                 Bitfield.Bit('algorithm', 6, 0),
+                 Bitfield.ReservedBit(2, 0),
+                 Bitfield.ReservedBit(24, 0)
+                 ),
+    )
+
+class RAKP1Message(Message):
+    __fields__ = (
+        UnsignedInt('message_tag', 1, 0),
+        Bitfield('reserved1', 3,
+                 Bitfield.ReservedBit(24, 0)
+                 ),
+        String('managed_system_session_id', 4, "\x00" * 4),
+        String('console_random_number', 16, os.urandom(16)),
+        Bitfield('role', 1,
+                 Bitfield.Bit('privilege_level', 4, 0x4), # ADMINISTRATOR level
+                 Bitfield.Bit('lookup', 1, 1),  # Name-only lookup
+                 Bitfield.ReservedBit(3, 0),
+                 ),
+        Bitfield('reserved2', 2,
+                 Bitfield.ReservedBit(16, 0),
+                 ),
+        UnsignedInt('user_name_length', 1, 0),
+        String('user_name', 16, '\x00' * 16),
+    )
+
+
+class RAKP2Message(Message):
+    def _length_ke_auth_code(obj):
+        if obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_NONE:
+            return 0
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_SHA1:
+            return 20
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_MD5:
+            return 16
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_SHA256:
+            return 32
+    __fields__ = (
+        UnsignedInt('message_tag', 1, 0),
+        MessageStatusCode(),
+        Bitfield('reserved1', 2,
+                 Bitfield.ReservedBit(16, 0)
+                 ),
+        String('console_session_id', 4, "\x00" * 4),
+        String('managed_system_random_number', 16, "\x00"* 16),
+        String('managed_system_guid', 16, "\x00" * 16),
+        VariableByteArray('ke_auth_code', _length_ke_auth_code),
+    )
+    def __init__(self, authentication_algorithm, *args, **kwargs):
+        Message.__init__(self, *args, **kwargs)
+        self.authentication_algorithm = authentication_algorithm
+
+
+class RAKP3Message(Message):
+    def _length_ke_auth_code(obj):
+        if obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_NONE:
+            return 0
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_SHA1:
+            return 20
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_MD5:
+            return 16
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_SHA256:
+            return 32
+    __fields__ = (
+        UnsignedInt('message_tag', 1, 0),
+        MessageStatusCode(),
+        Bitfield('reserved1', 2,
+                 Bitfield.ReservedBit(16, 0)
+                 ),
+        String('managed_system_session_id', 4, '\x00' * 4),
+        VariableByteArray('ke_auth_code', _length_ke_auth_code)
+
+    )
+    def __init__(self, authentication_algorithm, *args, **kwargs):
+        Message.__init__(self, *args, **kwargs)
+        self.authentication_algorithm = authentication_algorithm
+
+class RAKP4Message(Message):
+    def _length_integrity_check_value(obj):
+        if obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_NONE:
+            return 0
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_SHA1:
+            return 12
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_MD5:
+            return 16
+        elif obj.authentication_algorithm is constants.AUTH_ALGO_RAKP_HMAC_SHA256:
+            return 16
+    __fields__ = (
+        UnsignedInt('message_tag', 1, 0),
+        MessageStatusCode(),
+        Bitfield('reserved1', 2,
+                 Bitfield.ReservedBit(16, 0)
+                 ),
+        String('console_session_id', 4, "\x00" * 4),
+        VariableByteArray('integrity_check_value', _length_integrity_check_value)
+    )
+    def __init__(self, authentication_algorithm, *args, **kwargs):
+        Message.__init__(self, *args, **kwargs)
+        self.authentication_algorithm = authentication_algorithm
+
+class GetPayloadActivationStatusReq(Message):
+    __fields__ = (
+        UnsignedInt('payload_type', 1, 0),
+    )
+
+class GetPayloadActivationStatusRsp(Message):
+    __fields__ = (
+        CompletionCode(),
+        Bitfield('instance_capacity', 1,
+                 Bitfield.ReservedBit(4, 0),
+                 Bitfield.Bit('capacity', 4, 0)
+                 ),
+        Bitfield('instance_bitmap', 2,
+                 Bitfield.Bit('bitmap1_8', 8, 0),
+                 Bitfield.Bit('bitmap9_16', 8, 0),
+                 ),
+    )
+
+class SOLPayloadRCToBMC(Message):
+    __fields__ = (
+        Bitfield("packet_seq", 1,
+                 Bitfield.Bit('number', 4, 0),
+                 Bitfield.ReservedBit(4, 0),
+                 ),
+        Bitfield('packet_ack_seq', 1,
+                 Bitfield.Bit('number', 4, 0),
+                 Bitfield.ReservedBit(4, 0),
+                 ),
+        UnsignedInt('character_count', 1, 0),
+        Bitfield('operation_status', 1,
+                 Bitfield.Bit("flush_outbound", 1, 0),
+                 Bitfield.Bit("flush_inbound", 1, 0),
+                 Bitfield.Bit("dcd_dsr", 1, 0),
+                 Bitfield.Bit("cts", 1, 0),
+                 Bitfield.Bit("break", 1, 0),
+                 Bitfield.Bit("ring_wor", 1, 0),
+                 Bitfield.Bit("ack_nack", 1, 0),
+                 Bitfield.ReservedBit(1, 0),
+                 ),
+        RemainingBytes('data'),
+    )
+
+class SOLPayloadBMCToRC(Message):
+    __fields__ = (
+        Bitfield("packet_seq", 1,
+                 Bitfield.Bit('number', 4, 0),
+                 Bitfield.ReservedBit(4, 0),
+                 ),
+        Bitfield('packet_ack_seq', 1,
+                 Bitfield.Bit('number', 4, 0),
+                 Bitfield.ReservedBit(4, 0),
+                 ),
+        UnsignedInt('character_count', 1, 0),
+        Bitfield('operation_status', 1,
+                 Bitfield.Bit("flush_outbound", 1, 0),
+                 Bitfield.Bit("flush_inbound", 1, 0),
+                 Bitfield.Bit("dcd_dsr", 1, 0),
+                 Bitfield.Bit("cts", 1, 0),
+                 Bitfield.Bit("break", 1, 0),
+                 Bitfield.Bit("ring_wor", 1, 0),
+                 Bitfield.Bit("ack_nack", 1, 0),
+                 Bitfield.ReservedBit(1, 0),
+                 ),
+        RemainingBytes('data'),
+    )
+
+class Ipmi20Msg(object):
+    """Message for RMCP+"""
+    HEADER_FORMAT = "!BBIIBB"
+    def __init__(self, session=None):
+        self.session = session
+
+    def _pack_session_id(self):
+        if self.session is not None:
+            session_id = int.from_bytes(self.session.sid, "big")
+        else:
+            session_id = 0
+        return session_id
+
+    def _pack_sequence_number(self):
+        if self.session is not None:
+            seq = self.session.sequence_number
+        else:
+            seq = 0
+
+        return struct.unpack("<I", struct.pack(">I", seq))[0]
+
+    def _pack_payload_type(self, payload_type):
+        if self.session is None:
+            final_payload_type = 0
+        else:
+            if self.session.is_authenticated:
+                final_payload_type = 1 << 7
+            if self.session.is_encrypted:
+                final_payload_type |= 1 << 6
+        final_payload_type |= payload_type
+        return final_payload_type
+
+    def pack(self, sdu, payload_type):
+        if sdu is not None:
+            data_len = len(sdu)
+        else:
+            data_len = 0
+
+        if self.session is not None:
+            auth_type = self.session.auth_type
+            if self.session.activated:
+                self.session.increment_sequence_number()
+        else:
+            auth_type = Session.AUTH_TYPE_RMCP_PLUS
+
+        pdu = struct.pack('!BBII',  # TODO: Verify if the packing is network or little endian
+                          auth_type,
+                          self._pack_payload_type(payload_type),
+                          self._pack_session_id(),
+                          self._pack_sequence_number(),
+                          )
+
+        if sdu is None:
+            pdu += py3_array_tobytes(array('B', list(data_len.to_bytes(2, 'little'))))
+            return pdu
+
+        if self.session is None or self.session.is_encrypted is False:
+            pdu += py3_array_tobytes(array('B', list(data_len.to_bytes(2, 'little'))))
+            pdu += sdu
+            return pdu
+
+        # Now the encryption starts
+        # 1. Pad the input
+        # TODO: move this to constant
+        block_size = 16
+        mod = (len(sdu) + 1) % block_size
+        if mod:
+            pad_length = block_size - mod
+            for i in range(pad_length):
+                sdu += (i+1).to_bytes(1, "big")
+        sdu += pad_length.to_bytes(1, "big")
+        # Now sdu contains the padded payload
+
+        # 2. Generate IV
+        initialization_vector = os.urandom(block_size)
+
+        # 3. Get K, K2
+        (k_1, k_2) = self.session.additional_encryption_keys
+        cipher_key = k_2[:16]
+        cipher = Cipher(algorithms.AES(cipher_key), modes.CBC(initialization_vector))
+        encryptor = cipher.encryptor()
+
+        # 4. Encrypt
+        ct = encryptor.update(sdu) + encryptor.finalize()
+
+
+        data_len = len(initialization_vector + ct)
+        pdu += py3_array_tobytes(array('B', list(data_len.to_bytes(2, 'little'))))
+        pdu += initialization_vector + ct
+
+        # Now add the Session trailer
+        # Auth code is either 12 or 16 bytes. Adding pad length (1 byte) and next header (1 byte)
+        # the total is either 14 or 18. So, to make it to a multiple of 4, we need to add 2 byte
+        # padding
+        session_trailer = bytes.fromhex("ffff") # padding of 2 bytes
+        padding_length = 2
+        session_trailer += padding_length.to_bytes(1, "big")
+        next_header = 0x07 # Next header should be 0x07 as per spec
+        session_trailer += next_header.to_bytes(1, "big")
+        pdu += session_trailer
+
+        # Calculate the auth code
+        auth_code = hmac.new(k_1, pdu, hashlib.sha1).digest()
+        auth_code = auth_code[:12]  # for HMAC-SHA1-96
+
+        pdu += auth_code
+        return pdu
+
+    def unpack(self, pdu):
+        header_len = struct.calcsize(self.HEADER_FORMAT)
+        header = pdu[:header_len]
+        (auth_type, payload_type, self.session_id, sequence_number, data_len_1, data_len_2) = \
+            struct.unpack(self.HEADER_FORMAT, header)
+
+        # The returned data is little endian. Conbine the two bytes for final length value
+        data_len = (data_len_2 << 8) + data_len_1
+        if self.session is not None and self.session.activated and self.session.is_encrypted:
+            trailer_len = 16
+        else:
+            trailer_len = 0
+        if len(pdu) < header_len + data_len + trailer_len:
+            raise DecodingError('short SDU ({:d},{:d},{:d},{:d})'.format(
+                len(pdu), header_len, data_len, trailer_len))
+        elif len(pdu) > header_len + data_len + trailer_len:
+            raise DecodingError('SDU has extra bytes ({:d},{:d},{:d},{:d})'.format(
+                len(pdu), header_len, data_len, trailer_len))
+
+        if data_len <= 0:
+            return None
+
+        if self.session is None or self.session.is_encrypted is False:
+            return pdu[header_len:header_len + data_len]
+        # Session is encrypted. Decrypt the data
+        (k_1, k_2) = self.session.additional_encryption_keys
+        cipher_key = k_2[:16]
+        iv = pdu[header_len:header_len + 16]
+        ct = pdu[header_len+16:header_len+data_len]
+        cipher = Cipher(algorithms.AES(cipher_key), modes.CBC(iv))
+        decryptor = cipher.decryptor()
+        sdu = decryptor.update(ct) + decryptor.finalize()
+        # Remove padding
+        padding_length = sdu[-1] #int.from_bytes(sdu[-1], "little")
+        sdu = sdu[:-(padding_length+1)]
+        # TODO: Verify auth code
+
+        return sdu
+
 class IpmiMsg(object):
     HEADER_FORMAT_NO_AUTH = '!BIIB'
     HEADER_FORMAT_AUTH = '!BII16BB'
@@ -350,14 +749,14 @@ class Rmcp(object):
     _session = None
 
     def __init__(self, slave_address=0x81, host_target_address=0x20,
-                 keep_alive_interval=1):
+                 keep_alive_interval=1, timeout=2.0):
         self.host = None
         self.port = None
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.seq_number = 0xff
         self.slave_address = slave_address
         self.host_target = Target(host_target_address)
-        self.set_timeout(2.0)
+        self.set_timeout(timeout)
         self.next_sequence_number = 0
         self.keep_alive_interval = keep_alive_interval
         self._stop_keep_alive = None
@@ -386,6 +785,23 @@ class Rmcp(object):
         ipmi = IpmiMsg(self._session)
         tx_data = ipmi.pack(data)
         self._send_rmcp_msg(tx_data, RMCP_CLASS_IPMI)
+
+    def _send_ipmi2_msg(self, data, payload_type):
+        log().debug('IPMI2.0 TX: {:s}'.format(
+            ' '.join('%02x' % b for b in array('B', data))))
+        ipmi = Ipmi20Msg(self._session)
+        tx_data = ipmi.pack(data, payload_type)
+        self._send_rmcp_msg(tx_data, RMCP_CLASS_IPMI)
+
+    def _receive_ipmi2_msg(self):
+        (_, class_of_msg, pdu) = self._receive_rmcp_msg()
+        if class_of_msg != RMCP_CLASS_IPMI:
+            raise DecodingError('invalid class field in ASF message')
+        msg = Ipmi20Msg(self._session)
+        data = msg.unpack(pdu)
+        log().debug('IPMI2.0 RX: {:s}'.format(
+            ' '.join('%02x' % b for b in array('B', data))))
+        return data
 
     def _receive_ipmi_msg(self):
         (_, class_of_msg, pdu) = self._receive_rmcp_msg()
@@ -438,6 +854,62 @@ class Rmcp(object):
         check_completion_code(rsp.completion_code)
         return rsp
 
+    def _open_session(self, session, auth_algo, integrity_algo, confidentiality_algo):
+        req = OpenSessionReq(auth_algo, integrity_algo, confidentiality_algo)
+        req.maximum_privilege.privilege_level = Session.PRIV_LEVEL_ADMINISTRATOR
+        rx_data = self._send_and_receive_rmcp2(encode_message(req),
+                                           constants.PAYLOAD_TYPE_OPEN_SESSION_REQUEST)
+        rsp = OpenSessionRsp()
+        decode_message(rsp, rx_data)
+
+        # TODO: Use proper exceptions
+        if rsp.message_status_code != constants.MSC_OK:
+            raise Exception("Open Session response failed")
+        # TODO: Check if authentication algorithm matches with what we asked for
+        rakp1 = RAKP1Message()
+        rakp1.message_tag = req.message_tag
+        rakp1.managed_system_session_id = rsp.managed_system_session_id
+        rakp1.user_name = session._auth_username
+        rakp1.user_name_length = len(session._auth_username)
+        rx_data = self._send_and_receive_rmcp2(encode_message(rakp1),
+                                               constants.PAYLOAD_TYPE_RAKP_MESSAGE_1)
+        rakp2 = RAKP2Message(req.authentication.algorithm)
+        decode_message(rakp2, rx_data)
+        # TODO: Use proper exceptions
+        if rakp2.message_status_code != constants.MSC_OK:
+            raise Exception("Open RAKP2 response failed")
+
+        if rakp2.console_session_id != req.console_session_id:
+            raise Exception(f"Invalid Console session id in RAKP2 packet: {rakp2.console_session_id}")
+        auth_code = b"".join([c.to_bytes(1, 'big') for c in rakp2.ke_auth_code])
+        sid_m = rakp2.console_session_id
+        sid_c = rsp.managed_system_session_id
+        r_m = rakp1.console_random_number
+        r_c = rakp2.managed_system_random_number
+        guid_c = rakp2.managed_system_guid
+        role_m = rakp1.role._value.to_bytes(1, 'big')
+        ulength_m = rakp1.user_name_length.to_bytes(1, 'big')
+        uname_m = rakp1.user_name.encode()
+        unencrypted_string = sid_m + sid_c + r_m + r_c + guid_c + role_m + ulength_m + uname_m
+        key = session._auth_password.encode()
+        expected_auth_code = hmac.new(key, unencrypted_string, hashlib.sha1).digest()
+        if expected_auth_code != auth_code:
+            raise Exception("Auth code mismatch")
+        rakp3 = RAKP3Message(req.authentication.algorithm)
+        rakp3.managed_system_session_id = sid_c
+        rakp3.ke_auth_code = hmac.new(key, r_c + sid_m + role_m + ulength_m + uname_m, hashlib.sha1).digest()
+        rx_data = self._send_and_receive_rmcp2(encode_message(rakp3),
+                                               constants.PAYLOAD_TYPE_RAKP_MESSAGE_3)
+        rakp4 = RAKP4Message(req.authentication.algorithm)
+        decode_message(rakp4, rx_data)
+        sik = hmac.new(key, r_m + r_c + role_m + ulength_m + uname_m, hashlib.sha1).digest()
+        expected_integrity_check_value = hmac.new(sik, r_m + sid_c + guid_c, hashlib.sha1).digest()
+        expected_integrity_check_value = expected_integrity_check_value[:12]
+        integrity_check_value = b"".join([c.to_bytes(1, 'big') for c in rakp4.integrity_check_value])
+        if expected_integrity_check_value != integrity_check_value:
+            raise Exception(f"Integrity check value mismatch: {expected_integrity_check_value} vs {integrity_check_value}")
+        return (sik, sid_c)
+
     def _activate_session(self, session, challenge):
         # activate session
         req = create_request_by_name('ActivateSession')
@@ -466,6 +938,64 @@ class Rmcp(object):
         rsp = self.send_and_receive(req)
         check_completion_code(rsp.completion_code)
 
+    def start_sol(self):
+        if self._session is None or self._session.activated is not True:
+            raise Exception("Session is not activated")
+        req = create_request_by_name("SetSessionPrivilegeLevel")
+        req.privilege_level.requested = Session.PRIV_LEVEL_ADMINISTRATOR
+        rsp = self.send_and_receive_rmcp2(req, constants.PAYLOAD_TYPE_IPMI)
+        if rsp.completion_code != constants.CC_OK:
+            raise Exception("Set session privilege level failed")
+        req = create_request_by_name("ActivateSOLPayload")
+        rsp = self.send_and_receive_rmcp2(req, constants.PAYLOAD_TYPE_IPMI)
+        if rsp.completion_code != constants.CC_OK:
+            raise Exception("Activate SOL payload failed")
+        # We need to set timeout to None before we start SOL so that we don't get a timeout
+        # self.set_timeout(0.0)
+        # Start SOL now
+        with self.transaction_lock:
+            # Send \r to get a response
+            seq_number = 1
+            packet_ack_seq = 0
+            accepted_character_count = 0
+            rc_to_bmc = SOLPayloadRCToBMC()
+            rc_to_bmc.data = b'\r'
+            while True:
+                if rc_to_bmc is not None:
+                    rc_to_bmc.packet_seq.number = seq_number
+                    rc_to_bmc.packet_ack_seq.number = packet_ack_seq
+                    rc_to_bmc.character_count = accepted_character_count
+                    tx_data = encode_message(rc_to_bmc)
+                    self._send_ipmi2_msg(tx_data, constants.PAYLOAD_TYPE_SOL)
+                try:
+                    rx_data = self._receive_ipmi2_msg()
+                except socket.timeout:
+                    continue
+
+                bmc_to_rc = SOLPayloadBMCToRC()
+                decode_message(bmc_to_rc, rx_data)
+                # TODO: Check bmc_to_rc.packet_ack_seq with seq_number
+                packet_ack_seq = bmc_to_rc.packet_seq.number
+                accepted_character_count = len(bmc_to_rc.data)
+                if accepted_character_count == 0:
+                    # This is a ACK only packet
+                    # No need to send an acknowledgement
+                    rc_to_bmc = None
+                    continue
+                data = bmc_to_rc.data.tobytes()
+                try:
+                    data = data.decode()
+                except UnicodeDecodeError:
+                    # print(data)
+                    pass
+                print(data, end="")
+                seq_number = 0  # ACK-only packet needs no sequence number
+                rc_to_bmc = SOLPayloadRCToBMC()
+                rc_to_bmc.data = b""
+
+
+        return rsp
+
     def establish_session(self, session):
         self._session = None
         self.host = session._rmcp_host
@@ -479,30 +1009,50 @@ class Rmcp(object):
         caps = self._get_channel_auth_cap()
         log().debug('%s' % caps)
 
-        # 2 - Get Session Challenge
-        log().debug('Get Session Challenge')
         session.auth_type = caps.get_max_auth_type()
-        rsp = self._get_session_challenge(session)
-        session_challenge = rsp.challenge_string
-        session.sid = rsp.temporary_session_id
-        self._session = session
+        if caps.ipmi_2_0 is True:
+            # Send RMCP+ Open Session Request
+            log().debug("Open Session Request")
+            (sik, session_id ) = self._open_session(session,
+                                                    constants.AUTH_ALGO_RAKP_HMAC_SHA1,
+                                                    constants.INTEGRITY_ALGO_HMAC_SHA1_96,
+                                                    constants.CONFIDENTIALITY_ALGO_AES_CBC_128)
+            session.sid = session_id
+            session.sequence_number = 0x02
+            session.activated = True
+            session.is_encrypted = True
+            session.is_authenticated = True
+            session.auth_type = caps.get_max_auth_type()
+            session.confidentiality_algorithm = constants.CONFIDENTIALITY_ALGO_AES_CBC_128
+            session.generate_additional_encryption_keys(sik)
+            self._session = session
+        elif caps.ipmi_1_5 is True:
+            # 2 - Get Session Challenge
+            log().debug('Get Session Challenge')
+            rsp = self._get_session_challenge(session)
+            session_challenge = rsp.challenge_string
+            session.sid = rsp.temporary_session_id
+            self._session = session
+            # 3 - Activate Session
+            log().debug('Activate Session')
+            rsp = self._activate_session(session, session_challenge)
+            self._session.sid = rsp.session_id
+            self._session.sequence_number = rsp.initial_inbound_sequence_number
+            self._session.activated = True
 
-        # 3 - Activate Session
-        log().debug('Activate Session')
-        rsp = self._activate_session(session, session_challenge)
-        self._session.sid = rsp.session_id
-        self._session.sequence_number = rsp.initial_inbound_sequence_number
-        self._session.activated = True
+            log().debug('Set Session Privilege Level')
+            # 4 - Set Session Privilege Level
+            self._set_session_privilege_level(Session.PRIV_LEVEL_ADMINISTRATOR)
 
-        log().debug('Set Session Privilege Level')
-        # 4 - Set Session Privilege Level
-        self._set_session_privilege_level(Session.PRIV_LEVEL_ADMINISTRATOR)
+            log().debug('Session opened')
 
-        log().debug('Session opened')
+            if self.keep_alive_interval:
+                self._stop_keep_alive = call_repeatedly(
+                        self.keep_alive_interval, self._get_device_id)
+        else:
+            raise NotSupportedError("Neither IPMI 2.0 nor IPMI 1.5 is supported by the BMC")
 
-        if self.keep_alive_interval:
-            self._stop_keep_alive = call_repeatedly(
-                    self.keep_alive_interval, self._get_device_id)
+
 
     def close_session(self):
         if self._stop_keep_alive:
@@ -524,6 +1074,11 @@ class Rmcp(object):
 
     def _inc_sequence_number(self):
         self.next_sequence_number = (self.next_sequence_number + 1) % 64
+
+    def _send_and_receive_rmcp2(self, payload, payload_type):
+        with self.transaction_lock:
+            self._send_ipmi2_msg(payload, payload_type)
+            return self._receive_ipmi2_msg()
 
     def _send_and_receive(self, target, lun, netfn, cmdid, payload):
         """Send and receive data using RMCP interface.
@@ -606,6 +1161,40 @@ class Rmcp(object):
                                          netfn=req.netfn,
                                          cmdid=req.cmdid,
                                          payload=encode_message(req))
+        rsp = create_message(req.netfn + 1, req.cmdid, req.group_extension)
+        decode_message(rsp, rx_data)
+        return rsp
+
+    def _wrap_ipmb(self, req):
+        header = IpmbHeaderReq()
+        header.netfn = req.netfn
+        header.rs_lun = req.lun
+        header.rs_sa = self.host_target.ipmb_address
+        header.rq_seq = self.next_sequence_number
+        header.rq_lun = 0
+        header.rq_sa = self.slave_address
+        header.cmdid = req.cmdid
+        payload = encode_message(req)
+        return encode_ipmb_msg(header, payload)
+
+
+    def _unwrap_ipmb(self, rx_data):
+        # Remove header and checksum
+        # TODO: verify checksum
+        return rx_data[6:-1]
+
+
+    def send_and_receive_rmcp2(self, req, payload_type):
+        """Interface function to send and receive an IPMI message.
+
+        target: IPMI target
+        req: IPMI message request
+
+        Returns the IPMI message response.
+        """
+        tx_data = self._wrap_ipmb(req)
+        rx_data = self._send_and_receive_rmcp2(tx_data, payload_type)
+        rx_data = self._unwrap_ipmb(rx_data)
         rsp = create_message(req.netfn + 1, req.cmdid, req.group_extension)
         decode_message(rsp, rx_data)
         return rsp
